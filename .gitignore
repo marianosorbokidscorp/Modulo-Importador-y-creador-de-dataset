@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+.mypy_cache/
+
+# Datasets / outputs (per-import, no son código)
+data/
+
+# DuckDB / parquet locales (a veces quedan en raíz por error)
+*.duckdb
+*.duckdb.wal
+
+# Credenciales / cache
+.env
+.env.local
+.token_cache.bin
+.token_cache.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Builds / artefactos
+*.egg-info/
+dist/
+build/
