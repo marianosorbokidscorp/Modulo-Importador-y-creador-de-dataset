@@ -1,8 +1,12 @@
 """
-Importer Power BI Dataflow — device code flow + descarga de partitions.
+Importer Power BI Dataflow — soporta dos flows de auth:
+  1. Username/Password (ROPC) — si llenás user+pass, usa este (requiere MFA OFF)
+  2. Device code — fallback si no hay user/pass (abrís browser y pegás código)
+Y luego descarga las partitions del CDM del dataflow.
 """
 from __future__ import annotations
 import io
+import os
 import threading
 from pathlib import Path
 import pandas as pd
@@ -14,21 +18,43 @@ SCOPES = ["https://analysis.windows.net/powerbi/api/.default"]
 DEFAULT_CLIENT_ID = "1950a258-227b-4e31-a9cf-717495945fc2"
 
 
+def _env(key: str, default: str = "") -> str:
+    return (os.getenv(key) or default).strip()
+
+
 class PBIDataflowImporter(BaseImporter):
     name = "pbi_dataflow"
     label = "Power BI Dataflow"
-    description = "Autenticación delegada (device code) contra Microsoft Power BI."
-    credential_fields = [
-        CredField(key="tenant_id",   label="Tenant ID", default="common",
-                  hint="Directorio Azure AD de tu organización. Usá 'common' si no sabés."),
-        CredField(key="workspace_id", label="Workspace ID",
-                  placeholder="00000000-0000-0000-0000-000000000000"),
-        CredField(key="dataflow_id",  label="Dataflow ID",
-                  placeholder="00000000-0000-0000-0000-000000000000"),
-        CredField(key="client_id",    label="Client ID (opcional)", required=False,
-                  placeholder="vacío = Azure CLI public client",
-                  hint="Solo si tu tenant bloquea el client default."),
-    ]
+    description = (
+        "Auth contra Microsoft Power BI. Llená user+password para auth directa "
+        "(no funciona con MFA), o dejá vacío para usar device code (browser)."
+    )
+
+    @property
+    def credential_fields(self):
+        # late-binding para leer .env en runtime
+        return [
+            CredField(key="tenant_id",   label="Tenant ID",
+                      default=_env("PBI_TENANT_ID", "common"),
+                      hint="Directorio Azure AD de tu organización. Usá 'common' si no sabés."),
+            CredField(key="username",    label="Username (opcional)",
+                      default=_env("PBI_USERNAME"), required=False,
+                      placeholder="user@tenant.com",
+                      hint="Auth directa (ROPC). Solo funciona si la cuenta NO tiene MFA."),
+            CredField(key="password",    label="Password (opcional)", type="password",
+                      default=_env("PBI_PASSWORD"), required=False,
+                      hint="Si lo dejás vacío, se usa device code."),
+            CredField(key="workspace_id", label="Workspace ID",
+                      default=_env("PBI_WORKSPACE_ID"),
+                      placeholder="00000000-0000-0000-0000-000000000000"),
+            CredField(key="dataflow_id",  label="Dataflow ID",
+                      default=_env("PBI_DATAFLOW_ID"),
+                      placeholder="00000000-0000-0000-0000-000000000000"),
+            CredField(key="client_id",    label="Client ID (opcional)",
+                      default=_env("PBI_CLIENT_ID", DEFAULT_CLIENT_ID), required=False,
+                      placeholder="vacío = Azure CLI public client",
+                      hint="Solo si tu tenant bloquea el client default."),
+        ]
 
     def run(self, report, tables, creds, state: ImportState, data_dir: Path):
         # Esto bloquea el thread esperando el device code → corremos en otro thread
@@ -39,30 +65,54 @@ class PBIDataflowImporter(BaseImporter):
     def _do(self, report, tables, creds, state: ImportState, data_dir: Path):
         try:
             import msal
-            tenant = creds.get("tenant_id") or "common"
-            client = creds.get("client_id") or DEFAULT_CLIENT_ID
-            ws = creds["workspace_id"]; df = creds["dataflow_id"]
+            tenant = (creds.get("tenant_id") or "common").strip()
+            client = (creds.get("client_id") or DEFAULT_CLIENT_ID).strip()
+            username = (creds.get("username") or "").strip()
+            password = (creds.get("password") or "").strip()
+            ws = creds["workspace_id"].strip(); df = creds["dataflow_id"].strip()
 
             app = msal.PublicClientApplication(
                 client_id=client,
                 authority=f"https://login.microsoftonline.com/{tenant}",
             )
-            flow = app.initiate_device_flow(scopes=SCOPES)
-            if "user_code" not in flow:
-                state.status = "error"; state.message = f"Device flow init failed: {flow}"
-                return
-            state.status = "waiting_auth"
-            state.user_code = flow["user_code"]
-            state.verification_uri = flow["verification_uri"]
-            state.message = f"Pegá el código {flow['user_code']} en {flow['verification_uri']}"
 
-            result = app.acquire_token_by_device_flow(flow)
-            if "access_token" not in result:
-                state.status = "error"; state.message = f"Auth failed: {result.get('error_description')}"
-                return
+            # === AUTH ===
+            token = None
+            if username and password:
+                # ROPC (Resource Owner Password Credentials)
+                state.status = "running"
+                state.message = f"Autenticando como {username} (ROPC)..."
+                result = app.acquire_token_by_username_password(
+                    username=username, password=password, scopes=SCOPES,
+                )
+                if "access_token" in result:
+                    token = result["access_token"]
+                else:
+                    err = result.get("error_description", str(result))[:300]
+                    # Si ROPC falla por MFA/Conditional Access, fallback a device code
+                    state.message = f"ROPC falló ({err[:100]}). Cambiando a device code..."
 
-            token = result["access_token"]
+            if token is None:
+                # Device code flow (interactivo via browser)
+                flow = app.initiate_device_flow(scopes=SCOPES)
+                if "user_code" not in flow:
+                    state.status = "error"
+                    state.message = f"Device flow init failed: {flow.get('error_description', flow)}"
+                    return
+                state.status = "waiting_auth"
+                state.user_code = flow["user_code"]
+                state.verification_uri = flow["verification_uri"]
+                state.message = f"Pegá el código {flow['user_code']} en {flow['verification_uri']}"
+                result = app.acquire_token_by_device_flow(flow)
+                if "access_token" not in result:
+                    state.status = "error"
+                    state.message = f"Auth failed: {result.get('error_description')}"
+                    return
+                token = result["access_token"]
+
             state.status = "running"
+            state.user_code = None  # limpiar para no mostrar más el code
+            state.verification_uri = None
             state.message = "Autenticado. Bajando model.json del dataflow..."
 
             s = requests.Session()

@@ -23,6 +23,13 @@ import duckdb
 import pandas as pd
 from flask import Flask, request, jsonify, render_template, send_from_directory
 
+# Cargar .env si existe — pre-llena los defaults de los importers (PBI_USERNAME, etc.)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(Path(__file__).resolve().parent / ".env")
+except ImportError:
+    pass  # python-dotenv opcional
+
 import catalog
 from importers import IMPORTERS, get_importer
 from importers.base import ImportState
